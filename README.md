@@ -34,7 +34,7 @@ The `if: failure()` means it only runs when something breaks — zero overhead o
 ```yaml
 - name: AutoHealer
   if: failure()
-  uses: YOUR_USERNAME/autohealer@v1
+  uses: SGX21/autohealer@v1
   with:
     anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
     gh_token: ${{ secrets.GH_PAT }}
@@ -68,7 +68,7 @@ jobs:
       # ── Add AutoHealer at the end ──────────────────────────────
       - name: AutoHealer
         if: failure()
-        uses: YOUR_USERNAME/autohealer@v1
+        uses: SGX21/autohealer@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           gh_token: ${{ secrets.GH_PAT }}
