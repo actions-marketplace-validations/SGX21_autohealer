@@ -1,0 +1,152 @@
+name: PR Approval Handler
+
+# ── Fires on every PR comment ───────────────────────────────────────────────
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  handle:
+    name: Handle approval or rejection
+    runs-on: ubuntu-latest
+
+    # Guard: only act on PR comments that are exactly a healer command.
+    # startsWith — prevents bots quoting the PR body (which lists the commands)
+    #              from accidentally triggering this workflow.
+    # !endsWith '[bot]' — skips all bot accounts (Assay Review, dependabot, etc.)
+    if: |
+      github.event.issue.pull_request != null &&
+      !endsWith(github.actor, '[bot]') &&
+      (
+        startsWith(github.event.comment.body, '/approve-fix') ||
+        startsWith(github.event.comment.body, '/reject-fix')
+      )
+
+    permissions:
+      contents: write        # merge, delete branch
+      pull-requests: write   # post comments, close PR
+      issues: write          # add emoji reactions to the command comment
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Validate: only the original triggerer or an admin can command ───
+      - name: Validate commenter and detect command
+        id: validate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Read PR body to extract the original actor the healer stored there
+          PR_BODY=$(gh pr view $PR_NUMBER --repo $REPO --json body -q '.body')
+
+          ORIGINAL_ACTOR=$(echo "$PR_BODY" \
+            | grep -oP '(?<=\*\*Triggered by:\*\* @)\S+' \
+            || echo "")
+
+          echo "Original actor : $ORIGINAL_ACTOR"
+          echo "Commenter      : $COMMENTER"
+
+          # Check if commenter is a repo admin / maintainer
+          PERMISSION=$(gh api repos/$REPO/collaborators/$COMMENTER/permission \
+            -q '.permission' 2>/dev/null || echo "none")
+
+          echo "Permission level: $PERMISSION"
+
+          if [ "$COMMENTER" = "$ORIGINAL_ACTOR" ] \
+              || [ "$PERMISSION" = "admin" ] \
+              || [ "$PERMISSION" = "maintain" ]; then
+            echo "AUTHORIZED=true" >> $GITHUB_OUTPUT
+          else
+            echo "AUTHORIZED=false" >> $GITHUB_OUTPUT
+            gh pr comment $PR_NUMBER --repo $REPO --body \
+              "⚠️ Only **@${ORIGINAL_ACTOR}** (who triggered the pipeline) or repo admins can approve or reject this fix."
+          fi
+
+          # Detect which command was used
+          if echo "$COMMENT_BODY" | grep -qE '^/approve-fix'; then
+            echo "COMMAND=approve" >> $GITHUB_OUTPUT
+          else
+            echo "COMMAND=reject"  >> $GITHUB_OUTPUT
+          fi
+
+      # ── APPROVE: squash-merge and let CI re-run automatically ───────────
+      - name: Merge fix
+        if: steps.validate.outputs.AUTHORIZED == 'true' && steps.validate.outputs.COMMAND == 'approve'
+        env:
+          # Must use GH_PAT here instead of GITHUB_TOKEN — GitHub intentionally
+          # blocks GITHUB_TOKEN-triggered pushes from firing other workflows
+          # (to prevent infinite loops). A PAT bypasses this restriction so
+          # the squash merge fires ci-cd.yml automatically.
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Thumbs up reaction so the commenter sees it was registered
+          gh api repos/$REPO/issues/comments/${{ github.event.comment.id }}/reactions \
+            -X POST -f content='+1' || true
+
+          # Squash merge keeps the git history clean
+          gh pr merge $PR_NUMBER --repo $REPO \
+            --squash \
+            --subject "fix: auto-healer applied fix (approved by @$COMMENTER)" \
+            --delete-branch
+
+          gh pr comment $PR_NUMBER --repo $REPO --body \
+            "✅ **Fix merged and branch deleted.**
+
+          The CI/CD pipeline will automatically re-run on the updated code. Approved by @$COMMENTER."
+
+      # ── REJECT: close the PR, delete the branch, explain next steps ─────
+      - name: Close and reject fix
+        if: steps.validate.outputs.AUTHORIZED == 'true' && steps.validate.outputs.COMMAND == 'reject'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh api repos/$REPO/issues/comments/${{ github.event.comment.id }}/reactions \
+            -X POST -f content='-1' || true
+
+          # Check current PR state — can't close a PR that's already merged
+          PR_STATE=$(gh pr view $PR_NUMBER --repo $REPO --json state,mergedAt \
+            --jq '{state: .state, mergedAt: .mergedAt}')
+          IS_MERGED=$(echo "$PR_STATE" | jq -r '.mergedAt != null')
+          PR_STATE_VAL=$(echo "$PR_STATE" | jq -r '.state')
+
+          echo "PR #$PR_NUMBER state: $PR_STATE_VAL, merged: $IS_MERGED"
+
+          if [ "$IS_MERGED" = "true" ]; then
+            # PR was already merged — can't close it, just inform the commenter
+            gh pr comment $PR_NUMBER --repo $REPO --body \
+              "⚠️ **@$COMMENTER** — this PR was already merged before the \`/reject-fix\` command arrived. The fix is now in the branch. If you want to revert it, open a new PR manually."
+            echo "PR already merged — skipping close."
+            exit 0
+          fi
+
+          if [ "$PR_STATE_VAL" = "closed" ]; then
+            echo "PR is already closed — nothing to do."
+            exit 0
+          fi
+
+          # PR is still open — safe to close
+          FIX_BRANCH=$(gh pr view $PR_NUMBER --repo $REPO --json headRefName -q '.headRefName')
+
+          gh pr close $PR_NUMBER --repo $REPO --comment \
+            "❌ **Fix rejected by @$COMMENTER.** This PR has been closed without merging.
+
+          **Next steps:**
+          - Fix the issue locally and push a new commit to the failing branch
+          - The auto-healer will re-analyze on the next pipeline failure
+          - Or open your own PR with a manual fix"
+
+          # Delete the auto-fix branch to keep the repo clean
+          git push origin --delete "$FIX_BRANCH" 2>/dev/null \
+            || gh api repos/$REPO/git/refs/heads/$FIX_BRANCH -X DELETE || true
