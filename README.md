@@ -21,7 +21,7 @@ Add this step to your existing pipeline **at the end**, after all your other ste
 ```yaml
 - name: AutoHealer
   if: failure()
-  uses: YOUR_USERNAME/autohealer@v1
+  uses: SGX21/autohealer@v1
   with:
     anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
     gh_token: ${{ secrets.GH_PAT }}
